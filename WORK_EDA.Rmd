@@ -1,0 +1,145 @@
+# Exploratory Data Analysis
+
+```{r, echo=FALSE, include=FALSE}
+# load require packages
+library(spatstat)
+library(tidyverse)
+library(ggplot2)
+library(smotefamily)
+library(cutpointr)
+library(caret)
+library(e1071)
+library(randomForest)
+library(gbm)
+library(nnet)
+library(FNN)
+library(hrbrthemes)
+library(ggridges)
+library(reshape2)
+```
+
+```{r, echo=FALSE}
+  if(require(spatstat.geom)) {
+  if(interactive()) {
+  data(murchison)
+  plot(murchison$faults, main="Murchison data", col="red")
+  plot(murchison$gold, add=TRUE, pch=".",col="blue")
+  #plot(murchison$greenstone, add=TRUE, col="lightgreen")
+  }
+  ## rescale to kilometres
+  mur <- solapply(murchison, rescale, s=1000, unitname="km") 
+  }
+```
+
+```{r, echo=FALSE}
+# obtain gold deposit
+gold <- murchison$gold
+class(gold)
+# obtain greenstone outcrop
+greenstone <- murchison$greenstone
+class(greenstone)
+# obtain faults
+faults <- murchison$faults
+class(faults)
+# obtain the window object
+W <- Window(gold)
+# plot gold deposits, greenstone outcrop, and faults
+par(mfrow = c(1, 3), mar = c(5, 5, 4, 1))
+plot(gold, pch = "+", cols = "blue", main = "Gold deposits")
+plot(faults, col = "brown", main = "Fault lines")
+plot(greenstone, col = "lightgreen", main = "Greenstone")
+plot(W, add = TRUE)
+```
+
+```{r, echo=FALSE}
+# let's try harmonize to the three objects
+mur_harmonise <- with(mur, 
+                      harmonise(X = pixellate(gold, dimyx = 128) > 0,
+                                D = distfun(faults),
+                                G = greenstone))
+
+```
+
+```{r, echo=FALSE}
+class(mur_harmonise)
+names(mur_harmonise) <- c("Gold deposit", "Distance to nearest fault", "Greenstone")
+
+plot(mur_harmonise, main = "")
+
+sapply(mur_harmonise, class) # these are all images
+
+# we can use use pairs.im() to convert these images into data frames
+mur_pairs_im <- pairs.im(mur_harmonise, plot = FALSE)
+mur_df <- as.data.frame(mur_pairs_im)
+# summary of mur_df
+summary(mur_df)
+```
+
+```{r, echo=FALSE}
+summary(mur_df)
+```
+
+```{r, echo=FALSE}
+str(mur_df)
+```
+
+```{r, echo=FALSE}
+# Histogram for Distance to nearest fault
+ggplot(mur_df, aes(x = `Distance to nearest fault`)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+  labs(title = "Histogram of Distance to Nearest Fault", x = "Distance to Nearest Fault", y = "Frequency") +
+  theme_minimal()
+
+# Histogram for Greenstone
+ggplot(mur_df, aes(x = Greenstone)) +
+  geom_histogram(binwidth = 0.1, fill = "lightgreen", color = "black") +
+  labs(title = "Histogram of Greenstone", x = "Greenstone", y = "Frequency") +
+  theme_minimal()
+
+# Bar plot for Gold deposit
+ggplot(mur_df, aes(x = as.factor(`Gold deposit`))) +
+  geom_bar(fill = "coral", color = "black") +
+  labs(title = "Bar Plot of Gold Deposit", x = "Gold Deposit", y = "Frequency") +
+  theme_minimal()
+```
+
+```{r, echo=FALSE}
+# Box plot for Distance to Nearest Fault by Gold Deposit
+ggplot(mur_df, aes(x = as.factor(`Gold deposit`), y = `Distance to nearest fault`)) +
+  geom_boxplot(fill = "lightblue", color = "black") +
+  labs(title = "Box Plot of Distance to Nearest Fault by Gold Deposit", x = "Gold Deposit", y = "Distance to Nearest Fault") +
+  theme_minimal()
+```
+
+```{r, echo=FALSE}
+# Compute correlation matrix
+correlation_matrix <- cor(mur_df %>% select(`Gold deposit`,`Distance to nearest fault`, Greenstone), use = "complete.obs")
+print(correlation_matrix)
+```
+
+```{r, echo=FALSE}
+melted_cormat <- melt(correlation_matrix)
+
+# Plot correlation heatmap with vertical x-axis labels
+ggplot(melted_cormat, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  labs(title = "Correlation Heatmap", x = "Variable", y = "Variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r, echo=FALSE}
+# Density plot for Distance to Nearest Fault
+ggplot(mur_df, aes(x = `Distance to nearest fault`, fill = as.factor(`Gold deposit`))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot of Distance to Nearest Fault", x = "Distance to Nearest Fault", y = "Density", fill = "Gold Deposit") +
+  theme_minimal()
+
+# Density plot for Greenstone
+ggplot(mur_df, aes(x = Greenstone, fill = as.factor(`Gold deposit`))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot of Greenstone", x = "Greenstone", y = "Density", fill = "Gold Deposit") +
+  theme_minimal()
+```

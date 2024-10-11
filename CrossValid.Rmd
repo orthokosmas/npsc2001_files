@@ -1,0 +1,680 @@
+---
+title: "Cross-Validation to Find Optimal Probability Benchmark"
+author: Alvin Alexander
+---
+
+```{r Setup, include=FALSE, echo=FALSE}
+library(rsample)
+library(dplyr)
+library(caret)
+library(pROC)
+library(spatstat)
+library(tidyverse)
+library(smotefamily)
+library(cutpointr)
+library(caret)
+library(e1071)
+library(randomForest)
+library(gbm)
+library(nnet)
+library(FNN)
+```
+
+
+```{r Murchison Dataset, echo=FALSE, include=FALSE}
+  if(require(spatstat.geom)) {
+  if(interactive()) {
+  data(murchison)
+  plot(murchison$faults, main="Murchison data", col="red")
+  plot(murchison$gold, add=TRUE, pch=".",col="blue")
+  #plot(murchison$greenstone, add=TRUE, col="lightgreen")
+  }
+  ## rescale to kilometres
+  mur <- solapply(murchison, rescale, s=1000, unitname="km") 
+  }
+```
+
+```{r}
+# obtain gold deposit
+gold <- murchison$gold
+class(gold)
+# obtain greenstone outcrop
+greenstone <- murchison$greenstone
+class(greenstone)
+# obtain faults
+faults <- murchison$faults
+class(faults)
+# obtain the window object
+W <- Window(gold)
+# plot gold deposits, greenstone outcrop, and faults
+par(mfrow = c(1, 3), mar = c(5, 5, 4, 1))
+plot(gold, pch = "+", cols = "blue", main = "Gold deposits")
+plot(faults, col = "brown", main = "Fault lines")
+plot(greenstone, col = "lightgreen", main = "Greenstone")
+plot(W, add = TRUE)
+
+```
+
+```{r}
+# let's try harmonize to the three objects
+mur_harmonise <- with(mur, 
+                      harmonise(X = pixellate(gold, dimyx = 128) > 0,
+                                D = distfun(faults),
+                                G = greenstone))
+
+class(mur_harmonise)
+names(mur_harmonise) <- c("Gold deposit", "Distance to nearest fault", "Greenstone")
+
+plot(mur_harmonise, main = "")
+
+sapply(mur_harmonise, class) # these are all images
+
+# we can use use pairs.im() to convert these images into data frames
+mur_pairs_im <- pairs.im(mur_harmonise, plot = FALSE)
+mur_df <- as.data.frame(mur_pairs_im)
+# summary of mur_df
+summary(mur_df)
+```
+
+```{r}
+set.seed(1)
+sample <- sample(c(TRUE, FALSE), nrow(mur_df), replace=TRUE, prob=c(0.7,0.3))
+train  <- mur_df[sample, ]
+test   <- mur_df[!sample, ]
+
+prop.table(table(train$`Gold deposit`))
+prop.table(table(test$`Gold deposit`))
+
+set.seed(2)
+train$`Gold deposit` <- as.factor(train$`Gold deposit`)
+
+smote.train <- DMwR::SMOTE(`Gold deposit`~., train, perc.over = 1000, perc.under = 450)
+
+prop.table(table(smote.train$`Gold deposit`))
+```
+
+
+```{r Create Folds, echo=FALSE, include=FALSE}
+set.seed(123)
+folds <- createFolds(smote.train$`Gold deposit`, k = 5, list = TRUE, returnTrain = FALSE)
+```
+
+## INTRODUCTION
+
+The purpose of this file is to find the optimal probability threshold to binarise the predicted probabilities from each model into either 0s or 1s representing gold predictions. It works through k-fold cross validation where I create five folds of the training data. Five iterations are run for each model where k-1 folds are used as training and the other one is used as testing. For each iteration, I create the appropriate model and evaluate the F1-score across several different probability thresholds. After running all the iterations, I calculate the average F1-score for each probability threshold and plot them accordingly. Where the F-1 score is maximised, that is the benchmark probability that I will be using. 
+
+Note: F1-score is an evaluation metric combines both the precision (the proportion of true positives among all the positives made by the model) and recall (the proportion of true positives among all the actual positives). It measures the tradeoff between these two metrics and ultimately shows that the model can correctly identify positive cases while minimising false positives and false negatives.
+
+The formula for the metric is below:
+$$
+\text{F1-Score} = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}
+$$
+Where
+
+$$
+\text{Precision} = \frac{\text{True Positives (TP)}}{\text{True Positives (TP)} + \text{False Positives (FP)}}
+$$
+
+$$
+\text{Recall} = \frac{\text{True Positives (TP)}}{\text{True Positives (TP)} + \text{False Negatives (FN)}}
+$$
+
+## LOGISTIC REGRESSION
+
+```{r Logistic Regression, echo=FALSE, include=FALSE}
+# Load necessary libraries
+library(caret)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create folds for K-fold cross-validation
+folds <- createFolds(smote.train$`Gold deposit`, k = 5, list = TRUE, returnTrain = FALSE)
+
+# Define thresholds to evaluate
+thresholds <- seq(0.3, 1, by = 0.05)
+
+# Initialize a list to store F1 scores for each fold and threshold
+f1_scores <- list()
+
+# Perform cross-validation
+for (i in 1:length(folds)) {
+  # Get the indices for the test and training sets
+  test_indices <- folds[[i]]
+  train_indices <- unlist(folds[-i])
+  
+  # Subset the data
+  train_data <- smote.train[train_indices, ]
+  test_data <- smote.train[test_indices, ]
+  
+  # Train a logistic regression model
+  model <- train(`Gold deposit` ~ ., data = train_data, method = "glm", family = "binomial")
+  
+  # Get the predicted probabilities on the test data
+  prob_predictions <- predict(model, newdata = test_data, type = "prob")[,2] # Probability for the positive class
+  
+  # Initialize a vector to store F1 scores for the current fold
+  fold_f1_scores <- numeric(length(thresholds))
+  
+  # Define factor levels for the actual and predicted values
+  actual_levels <- levels(as.factor(test_data$`Gold deposit`))
+  pred_levels <- c("0", "1")  # Ensure this matches your binary classification
+  
+  for (j in 1:length(thresholds)) {
+    threshold <- thresholds[j]
+    
+    # Convert probabilities to binary predictions based on the current threshold
+    binary_predictions <- ifelse(prob_predictions >= threshold, "1", "0")
+    
+    # Convert binary_predictions and actual values to factors with the same levels
+    binary_predictions <- factor(binary_predictions, levels = pred_levels)
+    actual_values <- factor(as.character(test_data$`Gold deposit`), levels = pred_levels)
+    
+    # Calculate confusion matrix
+    confusion <- confusionMatrix(binary_predictions, actual_values)
+    
+    # Extract precision and recall from the confusion matrix
+    precision <- confusion$byClass["Precision"]
+    recall <- confusion$byClass["Sensitivity"]
+    
+    # Calculate F1 score
+    if (precision + recall == 0) {
+      f1_score <- 0
+    } else {
+      f1_score <- 2 * (precision * recall) / (precision + recall)
+    }
+    
+    # Store the F1 score for the current threshold
+    fold_f1_scores[j] <- f1_score
+  }
+  
+  # Store the F1 scores for the current fold
+  f1_scores[[i]] <- fold_f1_scores
+}
+
+# Convert the list of F1 scores to a matrix for easier aggregation
+f1_score_matrix <- do.call(rbind, f1_scores)
+
+# Calculate the average F1 score across all folds for each threshold
+mean_f1_score <- apply(f1_score_matrix, 2, mean, na.rm = TRUE)
+
+# Combine thresholds and mean F1 scores into a data frame
+f1_score_df <- data.frame(threshold = thresholds, f1_score = mean_f1_score)
+```
+
+```{r, echo=FALSE}
+# Print the result
+print(f1_score_df)
+
+# Plot F1 score vs. threshold
+
+# Find the index of the maximum F1 score
+max_index <- which.max(f1_score_df$f1_score)
+
+# Extract the threshold and F1 score at the maximum
+max_threshold <- f1_score_df$threshold[max_index]
+max_f1_score <- f1_score_df$f1_score[max_index]
+
+
+plot(f1_score_df$threshold, f1_score_df$f1_score, type = "l", 
+     xlab = "Threshold", ylab = "Mean F1 Score", 
+     main = "Mean F1 Score for Logistic Regression")
+
+# Add vertical line at the threshold that maximizes the F1 score
+abline(v = max_threshold, col = "blue", lty = 2)
+
+# Add horizontal line at the maximum F1 score
+abline(h = max_f1_score, col = "red", lty = 2)
+
+# Add text labels
+text(x=0.4, y=0.9,labels = sprintf("Threshold: %.2f\nF1 Score: %.2f", max_threshold, max_f1_score), cex = 0.8, col = "black")
+
+#Add point
+points(max_threshold, max_f1_score, pch = 19, col = "black")
+```
+
+
+
+# SVM
+
+```{r SVM, echo=FALSE, include=FALSE}
+# Load necessary libraries
+# Load necessary libraries
+library(caret)
+library(e1071)  # e1071 contains the SVM implementation
+
+# Define thresholds to evaluate
+thresholds <- seq(0.3, 1, by = 0.05)
+
+# Initialize a list to store F1 scores for each fold and threshold
+f1_scores <- list()
+
+# Perform cross-validation
+for (i in 1:length(folds)) {
+  # Get the indices for the test and training sets
+  test_indices <- folds[[i]]
+  train_indices <- unlist(folds[-i])
+  
+  # Subset the data
+  train_data <- smote.train[train_indices, ]
+  test_data <- smote.train[test_indices, ]
+  
+  # Train an SVM model
+  model <- svm(`Gold deposit` ~ ., data = train_data, probability = TRUE)
+
+  # Get the predicted probabilities on the test data
+  prob_predictions <- predict(model, newdata = test_data, probability = TRUE)
+  prob_predictions <- attr(prob_predictions, "probabilities")[,2]
+
+  # Initialize a vector to store F1 scores for the current fold
+  fold_f1_scores <- numeric(length(thresholds))
+  
+  for (j in 1:length(thresholds)) {
+    threshold <- thresholds[j]
+    
+    # Convert probabilities to binary predictions based on the current threshold
+    binary_predictions <- ifelse(prob_predictions >= threshold, "1", "0")
+    
+    # Convert binary predictions and actual values to factors with the same levels
+    binary_predictions <- factor(binary_predictions, levels = c("0", "1"))
+    actual_values <- factor(as.character(test_data$`Gold deposit`), levels = c("0", "1"))
+    
+    # Calculate confusion matrix
+    confusion <- confusionMatrix(binary_predictions, actual_values)
+    
+    # Extract precision and recall from the confusion matrix
+    precision <- confusion$byClass["Precision"]
+    recall <- confusion$byClass["Sensitivity"]
+    
+    # Calculate F1 score
+    if (precision + recall == 0) {
+      f1_score <- 0
+    } else {
+      f1_score <- 2 * (precision * recall) / (precision + recall)
+    }
+    
+    # Store the F1 score for the current threshold
+    fold_f1_scores[j] <- f1_score
+  }
+  
+  # Store the F1 scores for the current fold
+  f1_scores[[i]] <- fold_f1_scores
+}
+
+# Convert the list of F1 scores to a matrix for easier aggregation
+f1_score_matrix <- do.call(rbind, f1_scores)
+
+# Calculate the average F1 score across all folds for each threshold
+mean_f1_score <- apply(f1_score_matrix, 2, mean, na.rm = TRUE)
+
+# Combine thresholds and mean F1 scores into a data frame
+f1_score_df <- data.frame(threshold = thresholds, f1_score = mean_f1_score)
+```
+
+```{r, echo=FALSE}
+# Print the result
+print(f1_score_df)
+
+# Find the index of the maximum F1 score
+max_index <- which.max(f1_score_df$f1_score)
+
+# Extract the threshold and F1 score at the maximum
+max_threshold <- f1_score_df$threshold[max_index]
+max_f1_score <- f1_score_df$f1_score[max_index]
+
+
+# Plot F1 score vs. threshold
+plot(f1_score_df$threshold, f1_score_df$f1_score, type = "l", 
+     xlab = "Threshold", ylab = "Mean F1 Score", 
+     main = "Mean F1 Score for SVM")
+
+# Add vertical line at the threshold that maximizes the F1 score
+abline(v = max_threshold, col = "blue", lty = 2)
+
+# Add horizontal line at the maximum F1 score
+abline(h = max_f1_score, col = "red", lty = 2)
+
+# Add text labels
+text(x=0.4, y=0.9,labels = sprintf("Threshold: %.2f\nF1 Score: %.2f", max_threshold, max_f1_score), cex = 0.8, col = "black")
+
+#Add point
+points(max_threshold, max_f1_score, pch = 19, col = "black")
+```
+
+## RANDOM FOREST
+
+```{r Random Forest, echo=FALSE, include=FALSE}
+# Load necessary libraries
+library(caret)
+library(randomForest)  # Load the Random Forest package
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create folds for K-fold cross-validation
+folds <- createFolds(smote.train$`Gold deposit`, k = 5, list = TRUE, returnTrain = FALSE)
+
+# Define thresholds to evaluate
+thresholds <- seq(0.3, 1, by = 0.05)
+
+# Initialize a list to store F1 scores for each fold and threshold
+f1_scores <- list()
+
+# Perform cross-validation
+for (i in 1:length(folds)) {
+  # Get the indices for the test and training sets
+  test_indices <- folds[[i]]
+  train_indices <- unlist(folds[-i])
+  
+  # Subset the data
+  train_data <- smote.train[train_indices, ]
+  test_data <- smote.train[test_indices, ]
+  
+  # Train a Random Forest model
+  model <- train(`Gold deposit` ~ ., data = train_data, method = "rf", preProcess = c("center", "scale"), tuneLength = 3)
+  
+  # Get the predicted probabilities on the test data
+  prob_predictions <- predict(model, newdata = test_data, type = "prob")[,2] # Probability for the positive class
+  
+  # Initialize a vector to store F1 scores for the current fold
+  fold_f1_scores <- numeric(length(thresholds))
+  
+  for (j in 1:length(thresholds)) {
+    threshold <- thresholds[j]
+    
+    # Convert probabilities to binary predictions based on the current threshold
+    binary_predictions <- ifelse(prob_predictions >= threshold, "1", "0")
+    
+    # Convert binary predictions and actual values to factors with the same levels
+    binary_predictions <- factor(binary_predictions, levels = c("0", "1"))
+    actual_values <- factor(as.character(test_data$`Gold deposit`), levels = c("0", "1"))
+    
+    # Calculate confusion matrix
+    confusion <- confusionMatrix(binary_predictions, actual_values)
+    
+    # Extract precision and recall from the confusion matrix
+    precision <- confusion$byClass["Precision"]
+    recall <- confusion$byClass["Sensitivity"]
+    
+    # Calculate F1 score
+    if (precision + recall == 0) {
+      f1_score <- 0
+    } else {
+      f1_score <- 2 * (precision * recall) / (precision + recall)
+    }
+    
+    # Store the F1 score for the current threshold
+    fold_f1_scores[j] <- f1_score
+  }
+  
+  # Store the F1 scores for the current fold
+  f1_scores[[i]] <- fold_f1_scores
+}
+
+# Convert the list of F1 scores to a matrix for easier aggregation
+f1_score_matrix <- do.call(rbind, f1_scores)
+
+# Calculate the average F1 score across all folds for each threshold
+mean_f1_score <- apply(f1_score_matrix, 2, mean, na.rm = TRUE)
+
+# Combine thresholds and mean F1 scores into a data frame
+f1_score_df <- data.frame(threshold = thresholds, f1_score = mean_f1_score)
+```
+
+```{r, echo=FALSE}
+# Print the result
+print(f1_score_df)
+
+# Find the index of the maximum F1 score
+max_index <- which.max(f1_score_df$f1_score)
+
+# Extract the threshold and F1 score at the maximum
+max_threshold <- f1_score_df$threshold[max_index]
+max_f1_score <- f1_score_df$f1_score[max_index]
+
+# Plot F1 score vs. threshold
+plot(f1_score_df$threshold, f1_score_df$f1_score, type = "l", 
+     xlab = "Threshold", ylab = "Mean F1 Score", 
+     main = "Mean F1 Score for Random Forest")
+
+# Add vertical line at the threshold that maximizes the F1 score
+abline(v = max_threshold, col = "blue", lty = 2)
+
+# Add horizontal line at the maximum F1 score
+abline(h = max_f1_score, col = "red", lty = 2)
+
+# Add text labels
+text(x=0.4, y=0.925,labels = sprintf("Threshold: %.2f\nF1 Score: %.2f", max_threshold, max_f1_score), cex = 0.8, col = "black")
+
+#Add point
+points(max_threshold, max_f1_score, pch = 19, col = "black")
+```
+
+## KNN
+
+```{r KNN, echo=FALSE, include=FALSE}
+# Load necessary libraries
+library(caret)
+library(class)  # For KNN functionality
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create folds for K-fold cross-validation
+folds <- createFolds(smote.train$`Gold deposit`, k = 5, list = TRUE, returnTrain = FALSE)
+
+# Define thresholds to evaluate
+thresholds <- seq(0.3, 1, by = 0.05)
+
+# Initialize a list to store F1 scores for each fold and threshold
+f1_scores <- list()
+
+# Perform cross-validation
+for (i in 1:length(folds)) {
+  # Get the indices for the test and training sets
+  test_indices <- folds[[i]]
+  train_indices <- unlist(folds[-i])
+  
+  # Subset the data
+  train_data <- smote.train[train_indices, ]
+  test_data <- smote.train[test_indices, ]
+  
+  # Train a KNN model
+  model <- train(`Gold deposit` ~ ., data = train_data, method = "knn", preProcess = c("center", "scale"), tuneLength = 5)
+  
+  # Get the predicted probabilities on the test data
+  prob_predictions <- predict(model, newdata = test_data, type = "prob")[,2] # Probability for the positive class
+  
+  # Initialize a vector to store F1 scores for the current fold
+  fold_f1_scores <- numeric(length(thresholds))
+  
+  for (j in 1:length(thresholds)) {
+    threshold <- thresholds[j]
+    
+    # Convert probabilities to binary predictions based on the current threshold
+    binary_predictions <- ifelse(prob_predictions >= threshold, "1", "0")
+    
+    # Convert binary predictions and actual values to factors with the same levels
+    binary_predictions <- factor(binary_predictions, levels = c("0", "1"))
+    actual_values <- factor(as.character(test_data$`Gold deposit`), levels = c("0", "1"))
+    
+    # Calculate confusion matrix
+    confusion <- confusionMatrix(binary_predictions, actual_values)
+    
+    # Extract precision and recall from the confusion matrix
+    precision <- confusion$byClass["Precision"]
+    recall <- confusion$byClass["Sensitivity"]
+    
+    # Calculate F1 score
+    if (precision + recall == 0) {
+      f1_score <- 0
+    } else {
+      f1_score <- 2 * (precision * recall) / (precision + recall)
+    }
+    
+    # Store the F1 score for the current threshold
+    fold_f1_scores[j] <- f1_score
+  }
+  
+  # Store the F1 scores for the current fold
+  f1_scores[[i]] <- fold_f1_scores
+}
+
+# Convert the list of F1 scores to a matrix for easier aggregation
+f1_score_matrix <- do.call(rbind, f1_scores)
+
+# Calculate the average F1 score across all folds for each threshold
+mean_f1_score <- apply(f1_score_matrix, 2, mean, na.rm = TRUE)
+
+# Combine thresholds and mean F1 scores into a data frame
+f1_score_df <- data.frame(threshold = thresholds, f1_score = mean_f1_score)
+```
+
+```{r, echo=FALSE}
+# Print the result
+print(f1_score_df)
+
+# Find the index of the maximum F1 score
+max_index <- which.max(f1_score_df$f1_score)
+
+# Extract the threshold and F1 score at the maximum
+max_threshold <- f1_score_df$threshold[max_index]
+max_f1_score <- f1_score_df$f1_score[max_index]
+
+# Plot F1 score vs. threshold
+plot(f1_score_df$threshold, f1_score_df$f1_score, type = "l", 
+     xlab = "Threshold", ylab = "Mean F1 Score", 
+     main = "Mean F1 Score for KNN")
+
+# Add vertical line at the threshold that maximizes the F1 score
+abline(v = max_threshold, col = "blue", lty = 2)
+
+# Add horizontal line at the maximum F1 score
+abline(h = max_f1_score, col = "red", lty = 2)
+
+# Add text labels
+text(x=0.38, y=0.912,labels = sprintf("Threshold: %.2f\nF1 Score: %.2f", max_threshold, max_f1_score), cex = 0.8, col = "black")
+
+#Add point
+points(max_threshold, max_f1_score, pch = 19, col = "black")
+```
+
+## BOOSTING
+
+```{r Boosting, echo=FALSE, include=FALSE}
+# Load necessary libraries
+library(caret)
+library(gbm)  # For Gradient Boosting Machine (GBM) functionality
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create folds for K-fold cross-validation
+folds <- createFolds(smote.train$`Gold deposit`, k = 5, list = TRUE, returnTrain = FALSE)
+
+# Define thresholds to evaluate
+thresholds <- seq(0.3, 1, by = 0.05)
+
+# Initialize a list to store F1 scores for each fold and threshold
+f1_scores <- list()
+
+# Perform cross-validation
+for (i in 1:length(folds)) {
+  # Get the indices for the test and training sets
+  test_indices <- folds[[i]]
+  train_indices <- unlist(folds[-i])
+  
+  # Subset the data
+  train_data <- smote.train[train_indices, ]
+  test_data <- smote.train[test_indices, ]
+  
+  # Train a GBM model
+  model <- gbm(
+    as.numeric(as.factor(train_data$`Gold deposit`)) - 1 ~ ., 
+    data = train_data,
+    distribution = "bernoulli",
+    n.trees = 1000,
+    shrinkage = 0.01,
+    interaction.depth = 3,
+    cv.folds = 5,
+    n.cores = 1
+  )
+  
+  # Get the predicted probabilities on the test data
+  prob_predictions <- predict(model, newdata = test_data, n.trees = 1000, type = "response") # Probability for the positive class
+  
+  # Initialize a vector to store F1 scores for the current fold
+  fold_f1_scores <- numeric(length(thresholds))
+  
+  for (j in 1:length(thresholds)) {
+    threshold <- thresholds[j]
+    
+    # Convert probabilities to binary predictions based on the current threshold
+    binary_predictions <- ifelse(prob_predictions >= threshold, "1", "0")
+    
+    # Convert binary predictions and actual values to factors with the same levels
+    binary_predictions <- factor(binary_predictions, levels = c("0", "1"))
+    actual_values <- factor(as.character(test_data$`Gold deposit`), levels = c("0", "1"))
+    
+    # Calculate confusion matrix
+    confusion <- confusionMatrix(binary_predictions, actual_values)
+    
+    # Extract precision and recall from the confusion matrix
+    precision <- confusion$byClass["Precision"]
+    recall <- confusion$byClass["Sensitivity"]
+    
+    # Calculate F1 score
+    if (precision + recall == 0) {
+      f1_score <- 0
+    } else {
+      f1_score <- 2 * (precision * recall) / (precision + recall)
+    }
+    
+    # Store the F1 score for the current threshold
+    fold_f1_scores[j] <- f1_score
+  }
+  
+  # Store the F1 scores for the current fold
+  f1_scores[[i]] <- fold_f1_scores
+}
+
+# Convert the list of F1 scores to a matrix for easier aggregation
+f1_score_matrix <- do.call(rbind, f1_scores)
+
+# Calculate the average F1 score across all folds for each threshold
+mean_f1_score <- apply(f1_score_matrix, 2, mean, na.rm = TRUE)
+
+# Combine thresholds and mean F1 scores into a data frame
+f1_score_df <- data.frame(threshold = thresholds, f1_score = mean_f1_score)
+```
+
+```{r, echo=FALSE}
+# Print the result
+print(f1_score_df)
+
+# Find the index of the maximum F1 score
+max_index <- which.max(f1_score_df$f1_score)
+
+# Extract the threshold and F1 score at the maximum
+max_threshold <- f1_score_df$threshold[max_index]
+max_f1_score <- f1_score_df$f1_score[max_index]
+
+# Plot F1 score vs. threshold
+plot(f1_score_df$threshold, f1_score_df$f1_score, type = "l", 
+     xlab = "Threshold", ylab = "Mean F1 Score", 
+     main = "Mean F1 Score for Boosting")
+
+# Add vertical line at the threshold that maximizes the F1 score
+abline(v = max_threshold, col = "blue", lty = 2)
+
+# Add horizontal line at the maximum F1 score
+abline(h = max_f1_score, col = "red", lty = 2)
+
+# Add text labels
+text(x=0.4, y=0.9,labels = sprintf("Threshold: %.2f\nF1 Score: %.2f", max_threshold, max_f1_score), cex = 0.8, col = "black")
+
+#Add point
+points(max_threshold, max_f1_score, pch = 19, col = "black")
+```
+
+

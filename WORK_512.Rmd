@@ -1,0 +1,361 @@
+---
+title: "512X512 Pixel Size"
+author: "Alvin Alexander"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r, include=FALSE, echo=FALSE}
+# load require packages
+library(spatstat)
+library(tidyverse)
+library(smotefamily)
+library(cutpointr)
+library(caret)
+library(e1071)
+library(randomForest)
+library(gbm)
+library(nnet)
+library(FNN)
+```
+
+
+### Murchison Data
+```{r, echo=FALSE}
+  if(require(spatstat.geom)) {
+  if(interactive()) {
+  data(murchison)
+  plot(murchison$faults, main="Murchison data", col="red")
+  plot(murchison$gold, add=TRUE, pch=".",col="blue")
+  #plot(murchison$greenstone, add=TRUE, col="lightgreen")
+  }
+  ## rescale to kilometres
+  mur <- solapply(murchison, rescale, s=1000, unitname="km") 
+  }
+```
+
+```{r, include=FALSE, echo=FALSE}
+# obtain gold deposit
+gold <- murchison$gold
+class(gold)
+# obtain greenstone outcrop
+greenstone <- murchison$greenstone
+class(greenstone)
+# obtain faults
+faults <- murchison$faults
+class(faults)
+# obtain the window object
+W <- Window(gold)
+# plot gold deposits, greenstone outcrop, and faults
+par(mfrow = c(1, 3), mar = c(5, 5, 4, 1))
+plot(gold, pch = "+", cols = "blue", main = "Gold deposits")
+plot(faults, col = "brown", main = "Fault lines")
+plot(greenstone, col = "lightgreen", main = "Greenstone")
+plot(W, add = TRUE)
+```
+
+
+```{r, include=FALSE, echo=FALSE}
+# let's try harmonize to the three objects
+mur_harmonise <- with(mur, 
+                      harmonise(X = pixellate(gold, dimyx = 512) > 0,
+                                D = distfun(faults),
+                                G = greenstone))
+```
+
+
+### Murchison Data Separated By Variable
+```{r,echo=FALSE}
+names(mur_harmonise) <- c("Gold deposit", "Distance to nearest fault", "Greenstone")
+
+plot(mur_harmonise, main = "")
+
+sapply(mur_harmonise, class) # these are all images
+
+# we can use use pairs.im() to convert these images into data frames
+mur_pairs_im <- pairs.im(mur_harmonise, plot = FALSE)
+mur_df <- as.data.frame(mur_pairs_im)
+```
+
+## Training/Testing Data
+
+### Perform Block-CV to Extract a Test Area
+```{r, echo=FALSE}
+# Define the block coordinates
+row_start <- 10
+row_end <- 428
+col_start <- 10
+col_end <- 195
+
+# Function to extract a block from an image
+extract_block <- function(image, row_start, row_end, col_start, col_end) {
+  # Convert image to matrix if needed
+  mat <- as.matrix(image)
+  # Extract the block
+  block <- mat[row_start:row_end, col_start:col_end]
+  return(block)
+}
+
+# Extract blocks from each image in the list
+block_list <- lapply(mur_harmonise, function(image) {
+  extract_block(image, row_start, row_end, col_start, col_end)
+})
+
+# Convert the blocks to image objects if needed
+block_images <- lapply(block_list, function(block) {
+  as.im(block)  # Convert matrix block back to an image object
+})
+
+names(block_images) <- c("Gold deposit", "Distance to nearest fault", "Greenstone")
+
+par(mfrow = c(1, 3), mar = c(5, 5, 4, 1))
+plot(block_images$`Gold deposit`, main = "Test: Gold Deposit")
+plot(block_images$`Distance to nearest fault`, main = "Test: Distance to Nearest Fault")
+plot(block_images$Greenstone, main = "Test: Greenstone")
+```
+
+### Extract Training Area
+
+```{r, echo=FALSE}
+# Function to mask out the block from an image
+mask_block <- function(image, row_start, row_end, col_start, col_end) {
+  # Convert image to matrix
+  mat <- as.matrix(image)
+  
+  # Create a mask matrix with all TRUE values
+  mask <- matrix(TRUE, nrow = nrow(mat), ncol = ncol(mat))
+  
+  # Set the block area to FALSE (mask it out)
+  mask[row_start:row_end, col_start:col_end] <- FALSE
+  
+  # Apply the mask: set masked area to NA
+  masked_image <- mat
+  masked_image[!mask] <- NA
+  
+  return(as.im(masked_image))
+}
+
+# Apply the masking function to each image
+masked_images <- lapply(mur_harmonise, function(image) {
+  mask_block(image, row_start, row_end, col_start, col_end)
+})
+
+# Set names for the images if desired
+names(masked_images) <- c("Gold deposit", "Distance to nearest fault", "Greenstone")
+
+# Set up a 1x3 plotting area
+par(mfrow = c(1, 3), mar = c(5, 5, 4, 1))
+
+# Plot each masked image
+plot(masked_images$`Gold deposit`, main = "Train: Gold Deposit")
+plot(masked_images$`Distance to nearest fault`, main = "Train: Distance to Nearest Fault")
+plot(masked_images$Greenstone, main = "Train: Greenstone")
+```
+
+### Summary of Training Data
+
+```{r, echo=FALSE}
+train <- pairs.im(masked_images, plot = FALSE)
+train_df <- as.data.frame(train)
+summary(train_df)
+```
+
+### Summary of Testing Data
+
+```{r, echo=FALSE}
+test <- pairs.im(block_images, plot = FALSE)
+test_df <- as.data.frame(test)
+summary(test_df)
+```
+
+### Proportions of Absence/Presence of Gold Deposits
+
+```{r, echo=FALSE}
+cat("Training")
+prop.table(table(train_df$`Gold deposit`))
+cat(sep="\n\n")
+cat("Testing")
+prop.table(table(test_df$`Gold deposit`))
+```
+
+### Perform SMOTE on Training Data
+
+```{r, echo=FALSE, include=FALSE}
+set.seed(2)
+train_df$`Gold deposit` <- as.factor(train_df$`Gold deposit`)
+
+smote.train <- DMwR::SMOTE(`Gold deposit`~., train_df, perc.over = 1000, perc.under = 450)
+```
+
+```{r, echo=FALSE}
+prop.table(table(smote.train$`Gold deposit`))
+```
+
+## Logistic Regression
+
+### Train
+
+```{r, echo=FALSE}
+logit_model.smote <- glm(`Gold deposit` ~ ., family = binomial(link = "logit"), data = smote.train)
+summary(logit_model.smote)
+```
+
+### Test
+
+```{r, echo=FALSE}
+logit.results.smote <- predict(logit_model.smote,newdata = test_df ,type='response')
+logit.results.smote <- ifelse(logit.results.smote > 0.3,1,0)
+logit.results.smote <- as.factor(logit.results.smote)
+logit_matrix <- confusionMatrix(as.factor(logit.results.smote), as.factor(test$`Gold deposit`), positive = '1')
+logit_matrix
+```
+
+## SVM Classifier
+
+### Train
+
+```{r, echo=FALSE}
+classifier.smote <- train(form = `Gold deposit` ~ ., 
+                 data = smote.train, 
+                 method = "svmLinear") 
+summary(classifier.smote)
+```
+
+### Test 
+
+```{r, echo=FALSE}
+svm.results.smote <- predict(classifier.smote, newdata = test_df)
+conf_matrix.smote <- confusionMatrix(as.factor(svm.results.smote), as.factor(test$`Gold deposit`), positive = '1')
+conf_matrix.smote
+```
+
+## Random Forest
+
+### Train/Test
+
+```{r, echo=FALSE}
+library(ipred)
+
+rf_model.smote <- train(form = as.factor(`Gold deposit`) ~ ., 
+                 data = smote.train, 
+                 method = "rf", ntree = 100) 
+
+rf_model.smote
+rf_pred <- predict(rf_model.smote, test_df, response = "prob")
+conf_matrix.rf <- confusionMatrix(as.factor(rf_pred), as.factor(test$`Gold deposit`), positive = '1')
+conf_matrix.rf
+```
+
+## Boosting
+
+### Train
+
+```{r, echo=FALSE}
+smote.train$`Gold deposit` <- as.numeric(as.factor(smote.train$`Gold deposit`))-1
+boost.smote <- gbm(`Gold deposit` ~ ., data = smote.train,
+             distribution = "bernoulli", n.trees = 1000)
+
+boost.smote
+```
+
+### Test
+
+```{r, echo=FALSE}
+boost.results.smote <- predict(boost.smote, newdata = test_df, type = "response")
+boost.pred.smote <- ifelse(boost.results.smote> 0.6, 1, 0)
+boost.pred.smote <- as.factor(boost.pred.smote)
+conf_matrix.boost <- confusionMatrix(as.factor(boost.pred.smote), as.factor(test$`Gold deposit`), positive = '1')
+conf_matrix.boost
+```
+
+
+## KNN
+
+### Train/Test
+
+```{r, echo=FALSE}
+smote.train <- smote.train %>%
+    mutate(across(where(is.factor), as.numeric))
+test_df <- test_df %>%
+    mutate(across(where(is.factor), as.numeric))
+knn.smote <- FNN::knn(train = smote.train, test = test_df, cl = smote.train$`Gold deposit`, k = 5)
+knn.smote <- as.factor(knn.smote)
+test_df$`Gold deposit` <- as.factor(test_df$`Gold deposit`)
+cf <- confusionMatrix(knn.smote, test_df$`Gold deposit`, positive = '1')
+cf
+```
+
+
+## Prospectivity Performance Maps
+
+```{r, echo=FALSE}
+
+par(mfrow = c(2, 3), mar = c(5, 5, 4, 1))
+
+suppressWarnings({
+test_df$`Gold deposit` <- as.factor(test_df$`Gold deposit`)
+ref_mat <- matrix(test_df$`Gold deposit`, nrow = 428, ncol=182)
+ref_mat_im <- im(ref_mat)
+plot(ref_mat_im, main = "Reference")
+
+log_mat <- matrix(logit.results.smote, nrow=428, ncol=182)
+log_mat_im <- im(log_mat)
+plot(log_mat_im, main = "Logistic Regression")
+
+svm_mat <- matrix(svm.results.smote, nrow=428, ncol=182)
+svm_mat_im <- im(svm_mat)
+plot(svm_mat_im, main = "SVM")
+
+rf_mat <- matrix(rf_pred, nrow=428, ncol=182)
+rf_mat_im <- im(rf_mat)
+plot(rf_mat_im, main = "Random Forest")
+
+boost_mat <- matrix(boost.pred.smote, nrow=428, ncol=182)
+boost_mat_im <- im(boost_mat)
+plot(boost_mat_im, main = "Boosting")
+
+knn_mat <- matrix(knn.smote, nrow = 428, ncol = 182) 
+knn_mat_im <- im(knn_mat)
+plot(knn_mat_im, main = "KNN")
+})
+```
+
+## Model Performance Comparison
+
+```{r, echo=FALSE}
+# Create a dataframe with the required data
+model_performance <- data.frame(
+  Model = c("Logistic Regression", "SVM Classifier", "Random Forest", "Boosting", "K-Nearest Neighbours"),
+  Balanced_Accuracy = c(90.44,90.32, 68.39, 76.26, 98.28),
+  Specificity = c(94.68, 94.42, 95.4, 97.34, 100),
+  Sensitivity = c(86.21, 86.21, 41.38, 55.17, 96.55)
+)
+
+# Print the dataframe
+print(model_performance)
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+library(ggplot2)
+library(reshape2)
+```
+
+```{r, echo=FALSE}
+# Reshape the data to a long format for easier plotting with ggplot
+model_performance_long <- melt(model_performance, id.vars = "Model", 
+                               variable.name = "Metric", value.name = "Value")
+
+# Plot the data using ggplot2 as a line chart
+ggplot(model_performance_long, aes(x = Model, y = Value, color = Metric, group = Metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(linewidth = 3) +
+  theme_minimal() +
+  labs(title = "Model Performance Metrics", y = "Percentage", x = "Model") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_manual(values = c("Balanced_Accuracy" = "skyblue", 
+                                "Specificity" = "lightgreen", 
+                                "Sensitivity" = "salmon"))
+```
+
